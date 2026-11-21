@@ -387,23 +387,28 @@ class NextConceptTransformer(Transformer):
                 x = x + self.transformer.wle(self.lvl_1L)
             return self._run_stack(prefix_emb, x, prefix_pad_mask)
 
-        z_prefix = x[:, :self.prefix_len, :]
-        x_target = x[:, self.prefix_len:, :]
+        t_target = sum(self.levels[self._lvl_first:])
+        p_eff = x.shape[1] - t_target
+        assert 1 <= p_eff <= self.prefix_len, (
+            f"effective prefix length p_eff={p_eff} must be in [1, {self.prefix_len}]"
+        )
+        z_prefix = x[:, :p_eff, :]
+        x_target = x[:, p_eff:, :]
 
         if self.use_post_upsample_conv:
             x_target = self._apply_post_upsample_convs_multi(x_target)
 
         prefix_emb = self.transformer.wte(z_prefix)
-        x = self.transformer.wte(x_target)
+        target_emb = self.transformer.wte(x_target)
 
         if not self.use_rope:
-            prefix_emb = prefix_emb + self.wpe(self.wp_prefix)
-            x = x + self.wpe(self.wp_1L)
+            prefix_emb = prefix_emb + self.wpe(self.wp_prefix[:, :p_eff])
+            target_emb = target_emb + self.wpe(self.wp_1L)
 
         if self.config.use_level_encoding:
-            x += self.transformer.wle(self.lvl_1L)
+            target_emb = target_emb + self.transformer.wle(self.lvl_1L)
 
-        return self._run_stack(prefix_emb, x, prefix_pad_mask)
+        return self._run_stack(prefix_emb, target_emb, prefix_pad_mask)
 
     def build_l0_query_input(self, batch_size, dtype=None):
         q = self.l0_queries.expand(batch_size, -1, -1)
@@ -424,38 +429,71 @@ class NextConceptTransformer(Transformer):
             torch.tensor(0.0, dtype=dtype, device=device))
         return bias
 
-    def _level0_slice(self, x, prefix_pad_mask=None):
-        P, l0 = self.prefix_len, self.levels[0]
+    def _level0_slice(self, x, prefix_pad_mask=None, p_eff=None):
+        P = p_eff if p_eff is not None else self.prefix_len
+        l0 = self.levels[0]
         if prefix_pad_mask is None:
             return x[:, P - l0:P, :]
-        last = (~prefix_pad_mask).sum(dim=1) - 1
+        pm = prefix_pad_mask[:, :P]
+        last = (~pm).sum(dim=1) - 1
         last = last.clamp(min=l0 - 1)
         offs = torch.arange(l0 - 1, -1, -1, device=x.device)
         pos = (last[:, None] - offs[None, :]).clamp(min=0, max=P - 1)
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+        p_eff = prefix_emb.shape[1]
+        p_full = self.prefix_len
         x = torch.cat([prefix_emb, x], dim=1)
 
-        attn_mask = self.attn_mask_for_masking
-        if prefix_pad_mask is not None:
-            attn_mask = attn_mask + self._prefix_pad_bias(
-                prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
+        use_flex = self.use_flex_attention and (p_eff == p_full)
+        if self.use_rope:
+            if p_eff == p_full:
+                rope = (self.rope_cos, self.rope_sin)
+            else:
+                rope = (
+                    torch.cat([self.rope_cos[:p_eff], self.rope_cos[p_full:]], dim=0),
+                    torch.cat([self.rope_sin[:p_eff], self.rope_sin[p_full:]], dim=0),
+                )
+        else:
+            rope = None
 
-        rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
-        if self.use_flex_attention:
+        if use_flex:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
                 x = block(x, rope_cos_sin=rope, block_mask=block_mask)
         else:
+            if p_eff < p_full:
+                top = torch.cat([
+                    self.attn_mask_for_masking[:, :, :p_eff, :p_eff],
+                    self.attn_mask_for_masking[:, :, :p_eff, p_full:],
+                ], dim=-1)
+                bottom = torch.cat([
+                    self.attn_mask_for_masking[:, :, p_full:, :p_eff],
+                    self.attn_mask_for_masking[:, :, p_full:, p_full:],
+                ], dim=-1)
+                base_mask = torch.cat([top, bottom], dim=-2)
+            else:
+                base_mask = self.attn_mask_for_masking
+            keep_mask = ~torch.isneginf(base_mask)
+            if prefix_pad_mask is not None:
+                pm = prefix_pad_mask[:, :p_eff].bool()
+                all_pad = pm.all(dim=1, keepdim=True)
+                col0 = torch.arange(p_eff, device=x.device).unsqueeze(0) == 0
+                safe_pm = torch.where(all_pad & col0, torch.zeros_like(pm), pm)
+                key_keep = torch.ones((pm.shape[0], 1, 1, x.shape[1]), dtype=torch.bool, device=x.device)
+                key_keep[:, :, :, :p_eff] = ~safe_pm[:, None, None, :]
+                attn_mask = keep_mask & key_keep
+            else:
+                attn_mask = keep_mask
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
         x = self.transformer.ln_f(x)
 
-        x_target = x[:, self.prefix_len:, :]
+        x_target = x[:, p_eff:, :]
         logits_list = []
         if self.predict_level0:
-            l0_h = self._level0_slice(x, prefix_pad_mask)
+            l0_h = self._level0_slice(x, prefix_pad_mask, p_eff=p_eff)
             logits_list.append(self._pad_vocab(self.lm_head_l0(l0_h)))
         offset = 0
         for i, level in enumerate(self.levels[self._lvl_first:]):
