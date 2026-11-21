@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.common import Transformer, Block, LayerNorm, precompute_rope_cos_sin
+from models.common import Transformer, Block, LayerNorm, precompute_rope_cos_sin, HAS_FLEX_ATTENTION
 from models.vqvae import VQVAE
 from utils.misc import count_params
 
@@ -23,15 +23,21 @@ class _TiedCodebookHead(nn.Module):
         if not self.trainable:
             self.register_buffer("E_sq", E_sq, persistent=False)
         self.register_buffer("d_scale", E_sq.mean().clamp(min=1e-12), persistent=False)
-        self.log_inv_T = nn.Parameter(torch.tensor(0.0)) if learn_scale \
-                         else torch.tensor(0.0)
+        if learn_scale:
+            self.log_inv_T = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.register_buffer("log_inv_T", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         z = self.proj(x)
-        E_sq = (self.E ** 2).sum(-1) if self.trainable else self.E_sq
-        neg_d2 = (2.0 * (z @ self.E.t()) - E_sq) / self.d_scale
-        out = neg_d2 * torch.exp(self.log_inv_T)
-        return out if self.bias is None else out + self.bias
+        z_f = z.float()
+        E_f = self.E.float()
+        E_sq_f = (E_f ** 2).sum(-1) if self.trainable else self.E_sq.float()
+        neg_d2 = (2.0 * (z_f @ E_f.t()) - E_sq_f) / self.d_scale.float()
+        out = neg_d2 * torch.exp(self.log_inv_T.float().clamp(-10.0, 6.0))
+        if self.bias is not None:
+            out = out + self.bias.float()
+        return out.to(z.dtype)
 
 
 class _SharedHeadView(nn.Module):
@@ -309,12 +315,15 @@ class NextConceptTransformer(Transformer):
         print("NCP Transformer, Total parameter count: %.2fM" % (total_params/1e6,))
         print("NCP Transformer, Non embedding parameter count: %.2fM" % (non_embd_params/1e6,))
         
+    def _should_use_flex_attention(self, device: torch.device) -> bool:
+        return bool(self.use_flex_attention and HAS_FLEX_ATTENTION and device.type not in ("xpu", "mps"))
+
     def _get_flex_block_mask(self, device):
         key = str(device)
         if key not in self._flex_block_masks:
             from torch.nn.attention.flex_attention import create_block_mask
             P = self.prefix_len
-            S = P + (self.L - self.levels[0])
+            S = self.attn_mask_for_masking.shape[-1]
             lvl = self.flex_lvl_full.to(device)
             block_causal = getattr(self.config, 'attn_pattern', 'block_diagonal') == 'block_causal'
 
@@ -368,7 +377,7 @@ class NextConceptTransformer(Transformer):
         rope_p = (self.rope_cos[:self.prefix_len],
                   self.rope_sin[:self.prefix_len]) if self.use_rope else None
         P = self.prefix_len
-        ctx_mask = torch.zeros(1, 1, P, P, device=h.device)
+        ctx_mask = torch.zeros(1, 1, P, P, device=h.device, dtype=h.dtype)
         for block in self.ctx_blocks:
             h = block(h, attn_mask=ctx_mask, rope_cos_sin=rope_p)
         return self.ctx_ln(h)
@@ -387,23 +396,31 @@ class NextConceptTransformer(Transformer):
                 x = x + self.transformer.wle(self.lvl_1L)
             return self._run_stack(prefix_emb, x, prefix_pad_mask)
 
-        z_prefix = x[:, :self.prefix_len, :]
-        x_target = x[:, self.prefix_len:, :]
+        t_target = sum(self.levels[self._lvl_first:])
+        p_eff = x.shape[1] - t_target
+        assert 1 <= p_eff <= self.prefix_len, (
+            f"effective prefix length p_eff={p_eff} must be in [1, {self.prefix_len}]"
+        )
+        z_prefix = x[:, :p_eff, :]
+        x_target = x[:, p_eff:, :]
 
         if self.use_post_upsample_conv:
             x_target = self._apply_post_upsample_convs_multi(x_target)
 
         prefix_emb = self.transformer.wte(z_prefix)
-        x = self.transformer.wte(x_target)
+        target_emb = self.transformer.wte(x_target)
 
         if not self.use_rope:
-            prefix_emb = prefix_emb + self.wpe(self.wp_prefix)
-            x = x + self.wpe(self.wp_1L)
+            prefix_emb = prefix_emb + self.wpe(self.wp_prefix[:, :p_eff])
+            target_emb = target_emb + self.wpe(self.wp_1L)
 
         if self.config.use_level_encoding:
-            x += self.transformer.wle(self.lvl_1L)
+            target_emb = target_emb + self.transformer.wle(self.lvl_1L)
 
-        return self._run_stack(prefix_emb, x, prefix_pad_mask)
+        prefix_emb = self.transformer.drop(prefix_emb)
+        target_emb = self.transformer.drop(target_emb)
+
+        return self._run_stack(prefix_emb, target_emb, prefix_pad_mask)
 
     def build_l0_query_input(self, batch_size, dtype=None):
         q = self.l0_queries.expand(batch_size, -1, -1)
@@ -424,38 +441,71 @@ class NextConceptTransformer(Transformer):
             torch.tensor(0.0, dtype=dtype, device=device))
         return bias
 
-    def _level0_slice(self, x, prefix_pad_mask=None):
-        P, l0 = self.prefix_len, self.levels[0]
+    def _level0_slice(self, x, prefix_pad_mask=None, p_eff=None):
+        P = p_eff if p_eff is not None else self.prefix_len
+        l0 = self.levels[0]
         if prefix_pad_mask is None:
             return x[:, P - l0:P, :]
-        last = (~prefix_pad_mask).sum(dim=1) - 1
+        pm = prefix_pad_mask[:, :P]
+        last = (~pm).sum(dim=1) - 1
         last = last.clamp(min=l0 - 1)
         offs = torch.arange(l0 - 1, -1, -1, device=x.device)
         pos = (last[:, None] - offs[None, :]).clamp(min=0, max=P - 1)
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+        p_eff = prefix_emb.shape[1]
+        p_full = self.prefix_len
         x = torch.cat([prefix_emb, x], dim=1)
 
-        attn_mask = self.attn_mask_for_masking
-        if prefix_pad_mask is not None:
-            attn_mask = attn_mask + self._prefix_pad_bias(
-                prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
+        use_flex = self._should_use_flex_attention(x.device) and (p_eff == p_full)
+        if self.use_rope:
+            if p_eff == p_full:
+                rope = (self.rope_cos, self.rope_sin)
+            else:
+                rope = (
+                    torch.cat([self.rope_cos[:p_eff], self.rope_cos[p_full:]], dim=0),
+                    torch.cat([self.rope_sin[:p_eff], self.rope_sin[p_full:]], dim=0),
+                )
+        else:
+            rope = None
 
-        rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
-        if self.use_flex_attention:
+        if use_flex:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
                 x = block(x, rope_cos_sin=rope, block_mask=block_mask)
         else:
+            if p_eff < p_full:
+                top = torch.cat([
+                    self.attn_mask_for_masking[:, :, :p_eff, :p_eff],
+                    self.attn_mask_for_masking[:, :, :p_eff, p_full:],
+                ], dim=-1)
+                bottom = torch.cat([
+                    self.attn_mask_for_masking[:, :, p_full:, :p_eff],
+                    self.attn_mask_for_masking[:, :, p_full:, p_full:],
+                ], dim=-1)
+                base_mask = torch.cat([top, bottom], dim=-2)
+            else:
+                base_mask = self.attn_mask_for_masking
+            keep_mask = ~torch.isneginf(base_mask)
+            if prefix_pad_mask is not None:
+                pm = prefix_pad_mask[:, :p_eff].bool()
+                all_pad = pm.all(dim=1, keepdim=True)
+                col0 = torch.arange(p_eff, device=x.device).unsqueeze(0) == 0
+                safe_pm = torch.where(all_pad & col0, torch.zeros_like(pm), pm)
+                key_keep = torch.ones((pm.shape[0], 1, 1, x.shape[1]), dtype=torch.bool, device=x.device)
+                key_keep[:, :, :, :p_eff] = ~safe_pm[:, None, None, :]
+                attn_mask = keep_mask & key_keep
+            else:
+                attn_mask = keep_mask
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
         x = self.transformer.ln_f(x)
 
-        x_target = x[:, self.prefix_len:, :]
+        x_target = x[:, p_eff:, :]
         logits_list = []
         if self.predict_level0:
-            l0_h = self._level0_slice(x, prefix_pad_mask)
+            l0_h = self._level0_slice(x, prefix_pad_mask, p_eff=p_eff)
             logits_list.append(self._pad_vocab(self.lm_head_l0(l0_h)))
         offset = 0
         for i, level in enumerate(self.levels[self._lvl_first:]):
@@ -487,14 +537,16 @@ class NextConceptTransformer(Transformer):
     def _sample_level_raw(self, logits, temperature, top_k, top_p):
         if temperature == 0:
             return logits.argmax(dim=-1)
-        logits_flat = logits.reshape(-1, logits.shape[-1]) / temperature
+        logits_flat = logits.reshape(-1, logits.shape[-1]).float() / temperature
         if top_k > 0:
-            kth = torch.topk(logits_flat, top_k, dim=-1).values[:, -1, None]
-            logits_flat = logits_flat.masked_fill(logits_flat < kth, -torch.inf)
+            k = min(int(top_k), logits_flat.shape[-1])
+            kth = torch.topk(logits_flat, k, dim=-1).values[:, -1, None]
+            logits_flat = torch.where(logits_flat < kth, torch.full_like(logits_flat, -torch.inf), logits_flat)
         sorted_logits, sorted_idx = torch.sort(logits_flat, dim=-1, descending=True)
-        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        remove = cumprobs - F.softmax(sorted_logits, dim=-1) > top_p
-        sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cumprobs = torch.cumsum(probs, dim=-1)
+        remove = cumprobs - probs > top_p
+        sorted_logits = torch.where(remove, torch.full_like(sorted_logits, -torch.inf), sorted_logits)
         logits_flat = torch.zeros_like(logits_flat).scatter_(-1, sorted_idx, sorted_logits)
         return torch.multinomial(F.softmax(logits_flat, dim=-1), num_samples=1).view(logits.shape[:-1])
 
@@ -504,10 +556,10 @@ class NextConceptTransformer(Transformer):
         L_cur = self.levels[level_idx + 1]
         x = torch.cat([prefix_emb, x], dim=1)
 
-        gen_mask = torch.zeros(1, 1, P + L_cur, P + L_cur, device=x.device)
+        gen_mask = torch.zeros(1, 1, P + L_cur, P + L_cur, device=x.device, dtype=x.dtype)
         gen_mask[:, :, :P, P:] = -torch.inf
         if pad_bias is not None:
-            gen_mask = gen_mask + F.pad(pad_bias, (0, L_cur))
+            gen_mask = gen_mask + F.pad(pad_bias.to(dtype=x.dtype), (0, L_cur))
         rope_k = (
             getattr(self, f'rope_cos_gen_{hidx}'),
             getattr(self, f'rope_sin_gen_{hidx}'),
@@ -562,7 +614,7 @@ class NextConceptTransformer(Transformer):
         if self.config.use_level_encoding:
             level_pos_embed = self.transformer.wle(self.lvl_1L)
         else:
-            level_pos_embed = torch.zeros(1, self.L - self.levels[0], self.config.n_embd, device=dev)
+            level_pos_embed = torch.zeros(1, self.L - self.levels[0], self.config.n_embd, device=dev, dtype=prefix_emb.dtype)
 
         if not self.use_rope:
             level_pos_embed = level_pos_embed + self.wpe(self.wp_1L)
@@ -572,11 +624,11 @@ class NextConceptTransformer(Transformer):
         _pbias = None
         if self.prefix_pad_id is not None:
             _pm = (prefix_tokens[:, :P] == self.prefix_pad_id)
-            _pbias = torch.zeros(_pm.shape[0], 1, 1, P, device=dev)
+            _pbias = torch.zeros(_pm.shape[0], 1, 1, P, device=dev, dtype=prefix_emb.dtype)
             _pbias[:, :, :, :P] = torch.where(
                 _pm[:, None, None, :],
-                torch.tensor(float('-inf'), device=dev),
-                torch.tensor(0.0, device=dev))
+                torch.tensor(float('-inf'), device=dev, dtype=prefix_emb.dtype),
+                torch.tensor(0.0, device=dev, dtype=prefix_emb.dtype))
 
         if idx is None and self.query_level0:
             l0 = self.levels[0]
@@ -589,13 +641,13 @@ class NextConceptTransformer(Transformer):
             if self.config.use_level_encoding:
                 q = q + self.transformer.wle(self.lvl_1L[:, :l0])
             h = torch.cat([prefix_emb, q], dim=1)
-            m0 = torch.zeros(1, 1, P + l0, P + l0, device=dev)
+            m0 = torch.zeros(1, 1, P + l0, P + l0, device=dev, dtype=h.dtype)
             m0[:, :, :P, P:] = float('-inf')
             if self.l0_ar:
                 m0[:, :, P:, P:] = torch.triu(
-                    torch.full((l0, l0), float('-inf'), device=dev), diagonal=1)
+                    torch.full((l0, l0), float('-inf'), device=dev, dtype=h.dtype), diagonal=1)
             if _pbias is not None:
-                m0 = m0 + F.pad(_pbias, (0, l0))
+                m0 = m0 + F.pad(_pbias.to(dtype=h.dtype), (0, l0))
             rope_0 = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
             if self.l0_ar:
                 _E0 = vq.embeddings[0]
@@ -630,9 +682,9 @@ class NextConceptTransformer(Transformer):
             assert self.predict_level0, "generate(idx=None) requires model.predict_level0 or query_level0"
             rope_p = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
             h = prefix_emb
-            pfx_mask = torch.zeros(1, 1, P, P, device=dev)
+            pfx_mask = torch.zeros(1, 1, P, P, device=dev, dtype=h.dtype)
             if _pbias is not None:
-                pfx_mask = pfx_mask + _pbias
+                pfx_mask = pfx_mask + _pbias.to(dtype=h.dtype)
             for block in self.transformer.blocks:
                 h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
             h = self.transformer.ln_f(h)
@@ -651,7 +703,7 @@ class NextConceptTransformer(Transformer):
                     self.rope_cos_gen_0, self.rope_sin_gen_0,
                 ) if self.use_rope else None
                 h = prefix_emb
-                pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
+                pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device, dtype=prefix_emb.dtype)
                 for block in self.transformer.blocks:
                     h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
                 prefix_kv = [(b.attn.cached_k, b.attn.cached_v) for b in self.transformer.blocks]
@@ -680,7 +732,7 @@ class NextConceptTransformer(Transformer):
                 if use_kv_cache:
                     for blk, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
                         blk.attn.cached_k, blk.attn.cached_v = pk, pv
-                    lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
+                    lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device, dtype=x.dtype)
                     for block in self.transformer.blocks:
                         x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
                     x = self.transformer.ln_f(x)

@@ -364,13 +364,13 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             counts = torch.zeros(V, device=device)
             new_centers.index_add_(0, assigns, samples.float())
             counts.index_add_(0, assigns, torch.ones_like(assigns, dtype=torch.float32))
-            mask = counts > 0
-            new_centers[mask] /= counts[mask].unsqueeze(1)
-            empty = (~mask).nonzero(as_tuple=False).flatten()
-            if empty.numel() > 0:
-                rand_idx = torch.randint(0, N, (empty.numel(),), device=device)
-                new_centers[empty] = samples[rand_idx].float()
-            centers = new_centers
+            mask = (counts > 0).unsqueeze(1)
+            safe_means = new_centers / counts.clamp_min(1.0).unsqueeze(1)
+            if int((~mask).sum().item()) > 0:
+                rand_idx = torch.randint(0, N, (V,), device=device)
+                centers = torch.where(mask, safe_means, samples[rand_idx].float())
+            else:
+                centers = safe_means
         self.embeddings[level_idx].weight.data.copy_(centers.to(self.embeddings[level_idx].weight.dtype))
         ema_cs = getattr(self, f'ema_cluster_size_{level_idx}')
         ema_w  = getattr(self, f'ema_w_{level_idx}')
@@ -439,11 +439,13 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         n_dead = int(dead.sum().item())
         if n_dead == 0 or flat_input.shape[0] == 0:
             return
-        src = torch.randint(0, flat_input.shape[0], (n_dead,), device=flat_input.device)
-        new_vecs = flat_input[src].to(emb_i.weight.dtype)
-        emb_i.weight.data[dead] = new_vecs
-        ema_w[dead] = new_vecs
-        ema_cs[dead] = self.restart_threshold
+        v_size = ema_cs.shape[0]
+        src = torch.randint(0, flat_input.shape[0], (v_size,), device=flat_input.device)
+        sampled = flat_input[src]
+        dead_2d = dead.unsqueeze(1)
+        emb_i.weight.data.copy_(torch.where(dead_2d, sampled.to(emb_i.weight.dtype), emb_i.weight.data))
+        ema_w.copy_(torch.where(dead_2d, sampled.to(ema_w.dtype), ema_w))
+        ema_cs.copy_(torch.where(dead, torch.full_like(ema_cs, float(self.restart_threshold)), ema_cs))
 
     def forward(self, z):
         z = z.float()
@@ -566,7 +568,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             sl, si = torch.sort(logits, descending=True, dim=-1)
             probs = F.softmax(sl, dim=-1)
             remove = (probs.cumsum(-1) - probs) > p
-            sl = sl.masked_fill(remove, float('-inf'))
+            sl = torch.where(remove, torch.full_like(sl, float('-inf')), sl)
             logits = torch.full_like(logits, float('-inf')).scatter(-1, si, sl)
         return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(-1)
 
@@ -648,7 +650,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             else:
                 z_q_level = emb_at_level
             z_q_level = self._apply_quant_resi(z_q_level, level_idx)
-            z_hat.add_(z_q_level)
+            z_hat = z_hat + z_q_level
             z_hats.append(z_hat)
             if return_zlevels:
                 z_levels.append(
@@ -658,7 +660,7 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
                         mode="area",
                     ).transpose(-1, -2)
                     if level_idx != len(self.levels) - 1
-                    else z_hat
+                    else z_hat.clone()
                 )
             level_accum += self.levels[level_idx]
 

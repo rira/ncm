@@ -222,3 +222,17 @@ benchmark/profile_output/
 artifacts/
 /eval/
 data/
+
+# Windows Intel XPU runtime, caches, and evaluation outputs
+.venv/
+.tools/
+.hf-cache/
+artifacts/
+data/
+/eval/
+outputs/
+.pytest_cache/
+__pycache__/
+runs/
+
+

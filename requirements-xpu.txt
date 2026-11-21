@@ -1,0 +1,19 @@
+# Intel Arc XPU runtime dependencies (Windows 11 / Python 3.12).
+# Install PyTorch XPU wheels first so PyPI never overwrites the +xpu build:
+#   uv pip install --python .venv\Scripts\python.exe torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+#   uv pip install --python .venv\Scripts\python.exe -r requirements-xpu.txt
+
+numpy
+omegaconf
+hydra-core
+transformers>=4.51
+huggingface_hub[cli]
+regex
+rouge_score
+sacrebleu
+pytest
+datasets
+pyarrow
+pymongo
+zstandard
+
