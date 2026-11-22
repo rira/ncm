@@ -1,3 +1,5 @@
+import os
+
 from tokenization.tokenizer import Tokenizer
 from transformers import AutoTokenizer
 
@@ -6,7 +8,9 @@ class HFTokenizer(Tokenizer):
     def __init__(self, model_id="gpt2", pad_token=None, eos_token=None, **kwargs):
         super().__init__()
         self.model_id = model_id
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id, **kwargs)
+        self.hf_tokenizer.model_max_length = 1_000_000
 
         if eos_token is not None:
             self.hf_tokenizer.eos_token = eos_token
