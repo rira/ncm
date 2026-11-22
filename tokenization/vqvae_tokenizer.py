@@ -18,6 +18,12 @@ class VQVAETokenizer(Tokenizer):
         vqvae.load_state_dict(torch.load(config.vqvae.checkpoint_path, weights_only=False, map_location='cpu')['model'], strict=True)
         return VQVAETokenizer(pre_tokenizer, vqvae)
     
+    def _device(self):
+        try:
+            return next(self.vqvae.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     def _adjust_length(self, ids: list[int]) -> list[list[int]]:
         batched_ids = []
         for i in range(0, len(ids), self.vqvae.context_length):
@@ -34,46 +40,46 @@ class VQVAETokenizer(Tokenizer):
     
     # Take a 1D list of pre_tokenized token ids and return a 1D list of VQ-VAE token ids
     def encode_pre_tokenized(self, ids_pre_tokenized: list[int]):
-        idx_pre_tokenized = torch.tensor(self._adjust_length(ids_pre_tokenized), dtype=torch.long)
+        idx_pre_tokenized = torch.tensor(self._adjust_length(ids_pre_tokenized), dtype=torch.long, device=self._device())
         ids = self.vqvae.encode(idx_pre_tokenized).squeeze().view(-1).tolist()
         return ids
     
     # syntatic sugar, Take a 2D tensor with ids and return a 2D tensor with VQ-VAE token ids
     def encode_pre_tokenized_idx(self, idx_pre_tokenized: torch.Tensor):
         assert idx_pre_tokenized.shape[-1] == self.vqvae.context_length, f"Input tensor must have the last dimension equal to {self.vqvae.context_length}"
-        ids = self.vqvae.encode(idx_pre_tokenized)
+        ids = self.vqvae.encode(idx_pre_tokenized.to(self._device()))
         return ids
      
     def decode(self, ids, skip_special_tokens: bool = False):
-        idx = torch.tensor(ids, dtype=torch.long, device=next(self.vqvae.parameters()).device).unsqueeze(0)
+        idx = torch.tensor(ids, dtype=torch.long, device=self._device()).unsqueeze(0)
         logits = self.vqvae.decode(idx).squeeze()
         x = torch.argmax(logits, dim=-1)
         x = self.pre_tokenizer.decode(x.tolist(), skip_special_tokens=skip_special_tokens)
         return x
     
     def reconstruct(self, text: str):
-        idx_bytes = torch.tensor(self.pre_tokenizer.encode(text), dtype=torch.long).unsqueeze(0)
+        idx_bytes = torch.tensor(self.pre_tokenizer.encode(text), dtype=torch.long, device=self._device()).unsqueeze(0)
         logits = self.vqvae.reconstruct(idx_bytes)
         x = torch.argmax(logits, dim=-1)
         x = self.pre_tokenizer.decode(x.squeeze().tolist())
         return x
     
     def reconstruct_text_from_ids(self, ids: list[int]):
-        idx_bytes = torch.tensor(ids, dtype=torch.long, device=next(self.vqvae.parameters()).device).unsqueeze(0)
+        idx_bytes = torch.tensor(ids, dtype=torch.long, device=self._device()).unsqueeze(0)
         logits = self.vqvae.reconstruct(idx_bytes)
         x = torch.argmax(logits, dim=-1)
         x = self.pre_tokenizer.decode(x.squeeze().tolist())
         return x
     
     def reconstruct_multiscales(self, text: str):
-        idx_pre_tokenized = torch.tensor(self.pre_tokenizer.encode(text), dtype=torch.long, device=next(self.vqvae.parameters()).device).unsqueeze(0)
+        idx_pre_tokenized = torch.tensor(self.pre_tokenizer.encode(text), dtype=torch.long, device=self._device()).unsqueeze(0)
         reconstructions = self.vqvae.reconstruct_multiscales(idx_pre_tokenized)
         reconstructions = [self.pre_tokenizer.decode_batch(x) for x in reconstructions]
 
         return reconstructions
     
     def decode_multiscales(self, idx, skip_special_tokens: bool = False):
-        _, z_levels = self.vqvae.vq.idx_to_zhats(idx, return_zlevels=True)
+        _, z_levels = self.vqvae.vq.idx_to_zhats(idx.to(self._device()), return_zlevels=True)
         B, _ = idx.shape
         reconstructions = [[] for _ in range(B)]
         for z_level in z_levels:
