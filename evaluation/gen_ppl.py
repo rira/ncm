@@ -1,10 +1,18 @@
 import math
+import os
+import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import xpu_compat
 
 
 @dataclass
@@ -23,7 +31,7 @@ def generation_perplexity(
     prompts: List[str],
     generated_texts: List[str],
     *,
-    device: Optional[str] = None,
+    device: Optional[Union[str, torch.device]] = None,
     score_only_generated: bool = True,
     batch_size: int = 8,
     max_length: Optional[int] = None,
@@ -33,13 +41,16 @@ def generation_perplexity(
     ref_model.eval()
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    ref_model.to(device)
+        target_device = xpu_compat.resolve_device()
+    elif isinstance(device, torch.device):
+        target_device = device
+    else:
+        target_device = xpu_compat.resolve_device(device)
+    ref_model.to(target_device)
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    
     use_offsets = getattr(tokenizer, "is_fast", False)
 
     n = len(prompts)
@@ -61,21 +72,21 @@ def generation_perplexity(
             truncation=True,
             max_length=_full_max,
             return_offsets_mapping=use_offsets,
-        ).to(device)
+        ).to(target_device)
 
         input_ids = enc_full["input_ids"]
         attn_mask = enc_full["attention_mask"]
         offset_mapping = enc_full.get("offset_mapping", None)
-        
+
         if offset_mapping is not None:
             offset_mapping = offset_mapping.cpu()
-            attn_mask_cpu  = attn_mask.cpu()
+            attn_mask_cpu = attn_mask.cpu()
 
         logits = ref_model(input_ids=input_ids, attention_mask=attn_mask).logits
 
-        shift_logits = logits[:, :-1, :]
+        shift_logits = logits[:, :-1, :].float()
         shift_labels = input_ids[:, 1:]
-        shift_mask   = attn_mask[:, 1:]
+        shift_mask = attn_mask[:, 1:]
 
         include = shift_mask.bool().clone()
 
@@ -95,13 +106,13 @@ def generation_perplexity(
                 is_gen = real_token & (offset_mapping[:, :, 0] >= prompt_char_lens)
 
                 # argmax returns 0 for all-False rows, so fix those up explicitly.
-                no_gen    = ~is_gen.any(dim=1)
+                no_gen = ~is_gen.any(dim=1)
                 first_gen = is_gen.long().argmax(dim=1)
                 first_gen[no_gen] = T
 
                 # In shift_labels (= input_ids[:, 1:]) the first generated token sits at first_gen - 1.
-                start_pos_vec = (first_gen - 1).clamp(min=0).to(device)
-                positions = torch.arange(T - 1, device=device).unsqueeze(0)
+                start_pos_vec = (first_gen - 1).clamp(min=0).to(target_device)
+                positions = torch.arange(T - 1, device=target_device).unsqueeze(0)
                 include = include & (positions >= start_pos_vec.unsqueeze(1))
             else:
                 enc_prompt = tokenizer(
@@ -111,7 +122,7 @@ def generation_perplexity(
                     truncation=True,
                     max_length=max_length,
                 )
-                prompt_lens = enc_prompt["attention_mask"].sum(dim=1).to(device)
+                prompt_lens = enc_prompt["attention_mask"].sum(dim=1).to(target_device)
                 # argmax on attn_mask gives the index of the first real token (N for left-padding with N pads).
                 padding_offset = attn_mask.long().argmax(dim=1)
                 for i in range(B):
@@ -119,25 +130,25 @@ def generation_perplexity(
                     include[i, :start_pos] = False
 
         log_probs = F.log_softmax(shift_logits, dim=-1)
-        nll_tok   = -log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        nll_tok = -log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
 
-        nll_sum   = (nll_tok * include.float()).sum(dim=1)
+        nll_sum = (nll_tok * include.float()).sum(dim=1)
         tok_count = include.sum(dim=1).to(torch.long)
 
         nll_sums.append(nll_sum.detach().cpu())
         tok_counts.append(tok_count.detach().cpu())
 
-    nll_sum   = torch.cat(nll_sums,   dim=0)
+    nll_sum = torch.cat(nll_sums, dim=0)
     tok_count = torch.cat(tok_counts, dim=0)
 
-    tok_count_safe  = torch.clamp(tok_count, min=1)
+    tok_count_safe = torch.clamp(tok_count, min=1)
     mean_nll_per_ex = nll_sum / tok_count_safe.float()
-    ppl_per_ex      = torch.exp(mean_nll_per_ex)
+    ppl_per_ex = torch.exp(mean_nll_per_ex)
 
     total_nll = float(nll_sum.sum().item())
     total_tok = int(tok_count.sum().item())
-    mean_nll  = total_nll / max(total_tok, 1)
-    mean_ppl  = math.exp(mean_nll)
+    mean_nll = total_nll / max(total_tok, 1)
+    mean_ppl = math.exp(mean_nll)
 
     return GenPPLResult(
         nll_sum=nll_sum,

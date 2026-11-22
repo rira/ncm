@@ -113,7 +113,7 @@ class VQVAE(nn.Module):
     @torch.no_grad()
     def reconstruct(self, x):
         z = self._encode_pre_quant(x)
-        z_q, _, _ = self.vq(z)
+        z_q, *_ = self.vq(z)
         x_recon = self.decoder(z_q)
         return x_recon
     

@@ -61,6 +61,10 @@ class SelfAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
+
         attn_mask = self._window_mask(T, x.device) if self.attn_window > 0 else None
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0
