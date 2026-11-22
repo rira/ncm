@@ -117,13 +117,15 @@ class SelfAttention(nn.Module):
                 k = self.cached_k = torch.cat([self.cached_k, k], dim=2)
                 v = self.cached_v = torch.cat([self.cached_v, v], dim=2)
 
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
+
         if block_mask is not None:
-            # flex_attention is not autocast-aware, so align q/k to v's dtype by hand.
-            if q.dtype != v.dtype:
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
             y = _flex_attention(q, k, v, block_mask=block_mask)
         else:
+            if attn_mask is not None and attn_mask.is_floating_point() and attn_mask.dtype != q.dtype:
+                attn_mask = attn_mask.to(dtype=q.dtype)
             # Causal only for multiple tokens with no explicit mask; a cached single token sees all.
             use_causal = True if attn_mask is None and T > 1 else False
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=use_causal)
