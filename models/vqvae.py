@@ -29,6 +29,7 @@ class VQVAE(nn.Module):
         pre_quant_norm_type='group',
         enc_positional=True,
         dec_positional=False,
+        pad_token_id: int | None = None,
         **kwargs
     ):
         super().__init__()
@@ -37,6 +38,7 @@ class VQVAE(nn.Module):
         self.vqvae_vocab_size = vqvae_vocab_size
         self.in_vocab_size = in_vocab_size
         self.context_length = context_length
+        self.pad_token_id = int(pad_token_id) if pad_token_id is not None else None
 
         # enc_layers=0 / dec_layers=1 reproduce the original architecture: encoder = wte+wpe lookup, decoder = one Block.
         self.encoder = Encoder(
@@ -45,6 +47,7 @@ class VQVAE(nn.Module):
             enc_attn_window=enc_attn_window,
             enc_conv_layers=enc_conv_layers, enc_conv_kernel=enc_conv_kernel,
             use_pos_emb=enc_positional,
+            pad_token_id=self.pad_token_id,
         )
         
         vq = hydra.utils.get_class(vector_quantizers[vector_quantizer_config.clss])
@@ -77,8 +80,23 @@ class VQVAE(nn.Module):
         print("VQVAE, Total parameter count: %.2fM" % (total_params/1e6,))
         print("VQVAE, Non embedding parameter count: %.2fM" % (non_embd_params/1e6,))
 
+    def _pad_mask_for_latent(self, x, latent_len):
+        if self.pad_token_id is None:
+            return None
+        pad_mask = x == self.pad_token_id
+        if latent_len == x.size(1):
+            return pad_mask.unsqueeze(-1)
+        f = x.size(1) // latent_len
+        if f > 0 and latent_len * f <= x.size(1):
+            return pad_mask[:, : latent_len * f].view(x.size(0), latent_len, f).all(dim=-1, keepdim=True)
+        return None
+
     def _encode_pre_quant(self, x):
         z = self.encoder(x)
+        pad_mask = self._pad_mask_for_latent(x, z.size(1))
+        if pad_mask is not None:
+            # Zero pads before GroupNorm/LayerNorm so pad embeddings cannot shift real-token stats.
+            z = z.masked_fill(pad_mask, 0.0)
         if self.pre_quant_norm is not None:
             if getattr(self, '_pre_quant_is_layer', False):
                 z = self.pre_quant_norm(z)
@@ -86,6 +104,8 @@ class VQVAE(nn.Module):
                 z = self.pre_quant_norm(z.transpose(1, 2)).transpose(1, 2)
         if self.pre_quant_drop is not None:
             z = self.pre_quant_drop(z)
+        if pad_mask is not None:
+            z = z.masked_fill(pad_mask, 0.0)
         return z
 
     def forward(self, x):
