@@ -114,6 +114,9 @@ class SelfAttention(nn.Module):
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
 
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
+
         new_kv = (k.contiguous(), v.contiguous()) if return_kv else None
         if previous is not None:
             k = torch.cat([previous[0], k], dim=2)
@@ -121,13 +124,17 @@ class SelfAttention(nn.Module):
         if stateful:
             self.cached_k, self.cached_v = k, v
 
+        # Align q/k to v's dtype for flex_attention and mixed-dtype SDPA (e.g. fp32 QK-norm under autocast).
+        if q.dtype != v.dtype or k.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
+
         if block_mask is not None:
-            # flex_attention is not autocast-aware, so align q/k to v's dtype by hand.
-            if q.dtype != v.dtype:
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
             y = _flex_attention(q, k, v, block_mask=block_mask)
         else:
+            # Keep torch.bool SDPA masks native; only align floating-point additive masks to q's dtype.
+            if attn_mask is not None and attn_mask.is_floating_point() and attn_mask.dtype != q.dtype:
+                attn_mask = attn_mask.to(dtype=q.dtype)
             # Causal only for multiple tokens with no explicit mask; a cached single token sees all.
             use_causal = True if attn_mask is None and T > 1 else False
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=use_causal)

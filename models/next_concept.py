@@ -89,6 +89,7 @@ class NextConceptTransformer(Transformer):
         self.l0_ar = bool(getattr(config, 'l0_autoregressive', False)) and self.query_level0
         self._lvl_first = 0 if self.query_level0 else 1
         T = self.L if self.query_level0 else self.L - self.levels[0]
+        self._t_target = T
         P = config.prefix_len
         # Read optional flags once: getattr on a missing DictConfig key raises and swallows an exception whose
         # traceback cycles back to the caller's frame, so doing it in generate() kept every call's tensors alive
@@ -295,6 +296,8 @@ class NextConceptTransformer(Transformer):
         ], dim=0).reshape(1, 1, P + T, P + T)
 
         self.register_buffer('attn_mask_for_masking', full_mask.contiguous())
+        # Precompute boolean keep mask (non-persistent to preserve checkpoint state_dict keys).
+        self.register_buffer('attn_keep_mask', (~torch.isneginf(full_mask)).contiguous(), persistent=False)
 
         self.use_flex_attention = bool(getattr(config, 'use_flex_attention', False))
         lvl_full = torch.cat([
@@ -369,11 +372,13 @@ class NextConceptTransformer(Transformer):
                     h = self.ctx_t5(input_ids=prefix_ids,
                                     attention_mask=am).last_hidden_state
             return self.ctx_proj(h.to(self.ctx_proj.weight.dtype))
+        p_eff = prefix_ids.shape[1]
+        assert 1 <= p_eff <= self.prefix_len, (
+            f"effective prefix length p_eff={p_eff} must be in [1, {self.prefix_len}]"
+        )
         h = self.ctx_wte(prefix_ids)
-        rope_p = (self.rope_cos[:self.prefix_len],
-                  self.rope_sin[:self.prefix_len]) if self.use_rope else None
-        P = self.prefix_len
-        ctx_mask = torch.zeros(1, 1, P, P, device=h.device)
+        rope_p = (self.rope_cos[:p_eff], self.rope_sin[:p_eff]) if self.use_rope else None
+        ctx_mask = torch.ones(1, 1, p_eff, p_eff, dtype=torch.bool, device=h.device)
         for block in self.ctx_blocks:
             h = block(h, attn_mask=ctx_mask, rope_cos_sin=rope_p)
         return self.ctx_ln(h)
@@ -392,23 +397,28 @@ class NextConceptTransformer(Transformer):
                 x = x + self.transformer.wle(self.lvl_1L)
             return self._run_stack(prefix_emb, x, prefix_pad_mask)
 
-        z_prefix = x[:, :self.prefix_len, :]
-        x_target = x[:, self.prefix_len:, :]
+        p_eff = x.shape[1] - self._t_target
+        min_p = self.levels[0] if self.predict_level0 else 1
+        assert min_p <= p_eff <= self.prefix_len, (
+            f"effective prefix length p_eff={p_eff} must be in [{min_p}, {self.prefix_len}]"
+        )
+        z_prefix = x[:, :p_eff, :]
+        x_target = x[:, p_eff:, :]
 
         if self.use_post_upsample_conv:
             x_target = self._apply_post_upsample_convs_multi(x_target)
 
         prefix_emb = self.transformer.wte(z_prefix)
-        x = self.transformer.wte(x_target)
+        target_emb = self.transformer.wte(x_target)
 
         if not self.use_rope:
-            prefix_emb = prefix_emb + self.wpe(self.wp_prefix)
-            x = x + self.wpe(self.wp_1L)
+            prefix_emb = prefix_emb + self.wpe(self.wp_prefix[:, :p_eff])
+            target_emb = target_emb + self.wpe(self.wp_1L)
 
         if self.config.use_level_encoding:
-            x += self.transformer.wle(self.lvl_1L)
+            target_emb = target_emb + self.transformer.wle(self.lvl_1L)
 
-        return self._run_stack(prefix_emb, x, prefix_pad_mask)
+        return self._run_stack(prefix_emb, target_emb, prefix_pad_mask)
 
     def build_l0_query_input(self, batch_size, dtype=None):
         q = self.l0_queries.expand(batch_size, -1, -1)
@@ -429,38 +439,81 @@ class NextConceptTransformer(Transformer):
             torch.tensor(0.0, dtype=dtype, device=device))
         return bias
 
-    def _level0_slice(self, x, prefix_pad_mask=None):
-        P, l0 = self.prefix_len, self.levels[0]
+    def _level0_slice(self, x, prefix_pad_mask=None, p_eff=None):
+        P = p_eff if p_eff is not None else self.prefix_len
+        l0 = self.levels[0]
         if prefix_pad_mask is None:
             return x[:, P - l0:P, :]
-        last = (~prefix_pad_mask).sum(dim=1) - 1
+        pm = prefix_pad_mask[:, :P].bool()
+        last = (~pm).sum(dim=1) - 1
         last = last.clamp(min=l0 - 1)
         offs = torch.arange(l0 - 1, -1, -1, device=x.device)
         pos = (last[:, None] - offs[None, :]).clamp(min=0, max=P - 1)
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+        B, p_eff, _ = prefix_emb.shape
+        p_full = self.prefix_len
+        min_p = self.levels[0] if self.predict_level0 else 1
+        assert min_p <= p_eff <= p_full, (
+            f"effective prefix length p_eff={p_eff} must be in [{min_p}, {p_full}]"
+        )
         x = torch.cat([prefix_emb, x], dim=1)
 
-        attn_mask = self.attn_mask_for_masking
-        if prefix_pad_mask is not None:
-            attn_mask = attn_mask + self._prefix_pad_bias(
-                prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
+        use_flex = self.use_flex_attention and (p_eff == p_full)
+        if self.use_rope:
+            if p_eff == p_full:
+                rope = (self.rope_cos, self.rope_sin)
+            else:
+                # Per-level RoPE resets each target chunk to 0, so slice prefix to p_eff and keep target offsets.
+                rope = (
+                    torch.cat([self.rope_cos[:p_eff], self.rope_cos[p_full:]], dim=0),
+                    torch.cat([self.rope_sin[:p_eff], self.rope_sin[p_full:]], dim=0),
+                )
+        else:
+            rope = None
 
-        rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
-        if self.use_flex_attention:
+        if use_flex:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
                 x = block(x, rope_cos_sin=rope, block_mask=block_mask)
         else:
+            if p_eff < p_full:
+                # Trailing pad keys are already masked, so slicing prefix queries/keys to p_eff is lossless.
+                top = torch.cat([
+                    self.attn_keep_mask[:, :, :p_eff, :p_eff],
+                    self.attn_keep_mask[:, :, :p_eff, p_full:],
+                ], dim=-1)
+                bottom = torch.cat([
+                    self.attn_keep_mask[:, :, p_full:, :p_eff],
+                    self.attn_keep_mask[:, :, p_full:, p_full:],
+                ], dim=-1)
+                keep_mask = torch.cat([top, bottom], dim=-2)
+            else:
+                keep_mask = self.attn_keep_mask
+
+            if prefix_pad_mask is not None:
+                assert prefix_pad_mask.shape[0] == B and prefix_pad_mask.shape[1] >= p_eff, (
+                    f"prefix_pad_mask shape {tuple(prefix_pad_mask.shape)} incompatible with ({B}, {p_eff})"
+                )
+                pm = prefix_pad_mask[:, :p_eff].to(device=x.device, dtype=torch.bool)
+                all_pad = pm.all(dim=1, keepdim=True)
+                col0 = torch.arange(p_eff, device=x.device).unsqueeze(0) == 0
+                # Keep column 0 unmasked on all-pad rows so SDPA softmax(-inf) never yields NaNs.
+                safe_pm = torch.where(all_pad & col0, torch.zeros_like(pm), pm)
+                key_keep = F.pad(~safe_pm, (0, x.shape[1] - p_eff), value=True)[:, None, None, :]
+                attn_mask = keep_mask & key_keep
+            else:
+                attn_mask = keep_mask
+
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
         x = self.transformer.ln_f(x)
 
-        x_target = x[:, self.prefix_len:, :]
+        x_target = x[:, p_eff:, :]
         logits_list = []
         if self.predict_level0:
-            l0_h = self._level0_slice(x, prefix_pad_mask)
+            l0_h = self._level0_slice(x, prefix_pad_mask, p_eff=p_eff)
             logits_list.append(self._pad_vocab(self.lm_head_l0(l0_h)))
         offset = 0
         for i, level in enumerate(self.levels[self._lvl_first:]):
