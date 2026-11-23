@@ -85,6 +85,7 @@ class SelfAttention(nn.Module):
 
 
     def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None,
+                split_prefix_len=None, prefix_attn_mask=None,
                 past_kv=None, return_kv=False):
         """Explicit prefix K/V is request-local and never mutates the legacy cache."""
         B, T, C = x.size()
@@ -127,11 +128,33 @@ class SelfAttention(nn.Module):
                 q = q.to(v.dtype)
                 k = k.to(v.dtype)
             y = _flex_attention(q, k, v, block_mask=block_mask)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+        elif split_prefix_len is not None and not self.caching and past_kv is None:
+            # Prefix->target keys are empty in block_diagonal; block_mask and cached KV stay unified.
+            if q.dtype != v.dtype:
+                q = q.to(v.dtype)
+                k = k.to(v.dtype)
+            P = int(split_prefix_len)
+            assert 0 < P < T, f"split_prefix_len={P} must be in (0, {T})"
+            drop_p = self.dropout if self.training else 0
+            if prefix_attn_mask is not None and prefix_attn_mask.is_floating_point() and prefix_attn_mask.dtype != q.dtype:
+                prefix_attn_mask = prefix_attn_mask.to(dtype=q.dtype)
+            if attn_mask is not None and attn_mask.is_floating_point() and attn_mask.dtype != q.dtype:
+                attn_mask = attn_mask.to(dtype=q.dtype)
+            y_p = F.scaled_dot_product_attention(
+                q[:, :, :P, :], k[:, :, :P, :], v[:, :, :P, :],
+                attn_mask=prefix_attn_mask, dropout_p=drop_p, is_causal=False,
+            )
+            y_t = F.scaled_dot_product_attention(
+                q[:, :, P:, :], k, v,
+                attn_mask=attn_mask, dropout_p=drop_p, is_causal=False,
+            )
+            y = torch.cat([y_p.transpose(1, 2), y_t.transpose(1, 2)], dim=1).reshape(B, T, C)
         else:
             # Causal only for multiple tokens with no explicit mask; a cached single token sees all.
             use_causal = True if attn_mask is None and T > 1 else False
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=use_causal)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         y = self.resid_dropout(self.c_proj(y))
         return (y, new_kv) if return_kv else y
@@ -199,8 +222,14 @@ class Block(nn.Module):
         return h
 
     def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None,
+                split_prefix_len=None, prefix_attn_mask=None,
                 past_kv=None, return_kv=False):
-        kv = dict(past_kv=past_kv, return_kv=return_kv)
+        kv = dict(
+            split_prefix_len=split_prefix_len,
+            prefix_attn_mask=prefix_attn_mask,
+            past_kv=past_kv,
+            return_kv=return_kv,
+        )
         if self.parallel_block:
             n = self.ln_1(x)
             a = self.attn(n, attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask, **kv)

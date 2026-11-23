@@ -76,6 +76,7 @@ class NextConceptTransformer(Transformer):
         vocab_size = config.vocab_size
         attn_pattern = config.attn_pattern if hasattr(config, 'attn_pattern') else 'block_diagonal'
         self.config = config
+        self.attn_pattern = attn_pattern
 
         # A tuple keeps the frozen VQ-VAE out of the module tree and the state dict.
         self.vqvae_local = (vqvae_local,)
@@ -295,6 +296,14 @@ class NextConceptTransformer(Transformer):
         ], dim=0).reshape(1, 1, P + T, P + T)
 
         self.register_buffer('attn_mask_for_masking', full_mask.contiguous())
+        target_keep = (~torch.isneginf(target_mask)).reshape(1, 1, T, T).contiguous()
+        self.register_buffer('target_keep_mask_bool', target_keep, persistent=False)
+        no_pad_target_mask = torch.cat(
+            [torch.ones((1, 1, T, P), dtype=torch.bool), target_keep],
+            dim=-1,
+        ).contiguous()
+        self.register_buffer('no_pad_target_mask_bool', no_pad_target_mask, persistent=False)
+        self.register_buffer('prefix_col0', (torch.arange(P).unsqueeze(0) == 0), persistent=False)
 
         self.use_flex_attention = bool(getattr(config, 'use_flex_attention', False))
         lvl_full = torch.cat([
@@ -440,19 +449,46 @@ class NextConceptTransformer(Transformer):
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+        B, P, _ = prefix_emb.shape
+        T_tgt = x.shape[1]
         x = torch.cat([prefix_emb, x], dim=1)
-
-        attn_mask = self.attn_mask_for_masking
-        if prefix_pad_mask is not None:
-            attn_mask = attn_mask + self._prefix_pad_bias(
-                prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
 
         rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
         if self.use_flex_attention:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
                 x = block(x, rope_cos_sin=rope, block_mask=block_mask)
+        elif self.attn_pattern == 'block_diagonal':
+            prefix_attn_mask = None
+            if prefix_pad_mask is not None:
+                assert prefix_pad_mask.shape == (B, P), (
+                    f"prefix_pad_mask shape {tuple(prefix_pad_mask.shape)} must match ({B}, {P})"
+                )
+                pm = prefix_pad_mask.to(device=x.device, dtype=torch.bool)
+                all_pad = pm.all(dim=1, keepdim=True)
+                # Keep col 0 unmasked on all-pad rows so SDPA softmax avoids all--inf NaNs.
+                safe_pm = pm & ~(all_pad & self.prefix_col0)
+                prefix_attn_mask = ~safe_pm[:, None, None, :]
+                tgt_pref_keep = prefix_attn_mask.expand(B, 1, T_tgt, P)
+                target_attn_mask = torch.cat(
+                    [tgt_pref_keep, self.target_keep_mask_bool.expand(B, 1, T_tgt, T_tgt)],
+                    dim=-1,
+                )
+            else:
+                target_attn_mask = self.no_pad_target_mask_bool
+            for block in self.transformer.blocks:
+                x = block(
+                    x,
+                    attn_mask=target_attn_mask,
+                    rope_cos_sin=rope,
+                    split_prefix_len=P,
+                    prefix_attn_mask=prefix_attn_mask,
+                )
         else:
+            attn_mask = self.attn_mask_for_masking
+            if prefix_pad_mask is not None:
+                attn_mask = attn_mask + self._prefix_pad_bias(
+                    prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
         x = self.transformer.ln_f(x)
