@@ -50,7 +50,7 @@ class SelfAttention(nn.Module):
         i = torch.arange(T, device=device)
         return (i[:, None] - i[None, :]).abs() <= self.attn_window
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask: torch.Tensor | None = None):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -62,6 +62,14 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
 
         attn_mask = self._window_mask(T, x.device) if self.attn_window > 0 else None
+        if key_padding_mask is not None:
+            kpm = key_padding_mask.bool()
+            real_q = (~kpm)[:, None, :, None]
+            real_k = (~kpm)[:, None, None, :]
+            eye = torch.eye(T, dtype=torch.bool, device=x.device)[None, None, :, :]
+            # All-pad queries attend to self so softmax(-inf) never yields NaN rows.
+            pad_mask = (real_q & real_k) | (~real_q & eye)
+            attn_mask = pad_mask if attn_mask is None else (pad_mask & attn_mask[None, None, :, :])
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0
         )
@@ -94,8 +102,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, key_padding_mask: torch.Tensor | None = None):
+        x = x + self.attn(self.ln_1(x), key_padding_mask=key_padding_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -118,11 +126,13 @@ class Encoder(nn.Module):
         enc_conv_layers=0,
         enc_conv_kernel=3,
         use_pos_emb=True,
+        pad_token_id: int | None = None,
     ):
         super().__init__()
 
         assert compression_factor ==1 or compression_factor % 2 == 0, "Compression factor must be a power of 2"
         self.compression_factor = compression_factor
+        self.pad_token_id = int(pad_token_id) if pad_token_id is not None else None
         self.wte = nn.Embedding(in_vocab_size, embed_dim)
         self.wpe = nn.Embedding(context_length, embed_dim) if use_pos_emb else None
         self.drop = nn.Dropout(dropout)
@@ -156,29 +166,44 @@ class Encoder(nn.Module):
                 conv.bias.zero_()
             self.down = conv
 
-    def _conv_stack(self, x):
+    def _conv_stack(self, x, pad_mask=None):
         for blk in self.conv_blocks:
             h = blk["ln"](x).transpose(1, 2)
             h = blk["c2"](F.gelu(blk["c1"](h))).transpose(1, 2)
             x = x + h
+            if pad_mask is not None:
+                x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return x
+
+    def _encode_features(self, x, pad_mask):
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        x = self._conv_stack(x, pad_mask=pad_mask)
+        for blk in self.blocks:
+            x = blk(x, key_padding_mask=pad_mask)
+        if self.ln_e is not None:
+            x = self.ln_e(x)
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         return x
 
     def forward(self, idx):
+        pad_mask = (idx == self.pad_token_id) if self.pad_token_id is not None else None
         tok_emb = self.wte(idx)
         if self.wpe is not None:
             pos = torch.arange(0, idx.size(1), dtype=torch.long, device=idx.device)
             tok_emb = tok_emb + self.wpe(pos)
-        x = self.drop(tok_emb)
-        x = self._conv_stack(x)
-        for blk in self.blocks:
-            x = blk(x)
-        if self.ln_e is not None:
-            x = self.ln_e(x)
+        x = self._encode_features(self.drop(tok_emb), pad_mask)
         if self.down is not None:
             x = self.down(x.transpose(1, 2)).transpose(1, 2)
+            if pad_mask is not None:
+                f = int(self.compression_factor)
+                down_pad = pad_mask[:, : x.size(1) * f].view(x.size(0), x.size(1), f).all(dim=-1)
+                x = x.masked_fill(down_pad.unsqueeze(-1), 0.0)
         return x
 
     def forward_nopos(self, idx):
+        pad_mask = (idx == self.pad_token_id) if self.pad_token_id is not None else None
         B, T, C = idx.shape[0], idx.shape[1], self.wte.embedding_dim
         pos = torch.arange(T, device=idx.device, dtype=torch.float32).unsqueeze(1)
         i = torch.arange(0, C, 2, device=idx.device, dtype=torch.float32)
@@ -187,12 +212,7 @@ class Encoder(nn.Module):
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         x = self.drop(self.wte(idx) + pe.to(self.wte.weight.dtype).unsqueeze(0))
-        x = self._conv_stack(x)
-        for blk in self.blocks:
-            x = blk(x)
-        if self.ln_e is not None:
-            x = self.ln_e(x)
-        return x
+        return self._encode_features(x, pad_mask)
 
 
 class Decoder(nn.Module):
