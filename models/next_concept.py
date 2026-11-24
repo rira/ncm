@@ -19,19 +19,35 @@ class _TiedCodebookHead(nn.Module):
             self.register_buffer("E", codebook.detach().clone(), persistent=False)
         self.out_features = V
         # Distance form, the inverse of z_to_idx's argmin ||z - E_i||^2: ||z||^2 cancels in the softmax, leaving 2 z.E_i - ||E_i||^2.
-        E_sq = (codebook.detach() ** 2).sum(-1)
+        E_sq = (codebook.detach().float() ** 2).sum(-1).to(codebook.dtype)
         if not self.trainable:
             self.register_buffer("E_sq", E_sq, persistent=False)
         self.register_buffer("d_scale", E_sq.mean().clamp(min=1e-12), persistent=False)
-        self.log_inv_T = nn.Parameter(torch.tensor(0.0)) if learn_scale \
-                         else torch.tensor(0.0)
+        if learn_scale:
+            self.log_inv_T = nn.Parameter(torch.tensor(0.0))
+        else:
+            # Buffer (not bare tensor) so .to(device)/.to(dtype) moves log_inv_T when learn_scale=False.
+            self.register_buffer("log_inv_T", torch.tensor(0.0), persistent=False)
+
+    def _forward_logits_fp32(self, x):
+        # Run F.linear in native z.dtype for fast low-precision GEMM before FP32 distance scaling and exp clamp.
+        z = self.proj(x)
+        E_w = self.E if self.E.dtype == z.dtype else self.E.to(z.dtype)
+        dot = F.linear(z, E_w)
+        if self.trainable:
+            E_sq_f = (E_w.float() if E_w.dtype != torch.float32 else E_w).pow(2).sum(-1)
+        else:
+            E_sq_f = self.E_sq.float()
+        inv_T = torch.exp(self.log_inv_T.float().clamp(-10.0, 6.0))
+        scale = (2.0 / self.d_scale.float()) * inv_T
+        out = (dot.float() - 0.5 * E_sq_f) * scale
+        if self.bias is not None:
+            out = out + self.bias.float()
+        return out, z.dtype
 
     def forward(self, x):
-        z = self.proj(x)
-        E_sq = (self.E ** 2).sum(-1) if self.trainable else self.E_sq
-        neg_d2 = (2.0 * (z @ self.E.t()) - E_sq) / self.d_scale
-        out = neg_d2 * torch.exp(self.log_inv_T)
-        return out if self.bias is None else out + self.bias
+        out, out_dtype = self._forward_logits_fp32(x)
+        return out.to(out_dtype)
 
 
 class _SharedHeadView(nn.Module):
